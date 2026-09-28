@@ -2434,6 +2434,11 @@ def _put_voice_frame(device: Device, chunk: bytes) -> None:
             pass
 
 
+# Scored frames (80ms each, ending with the wake frame) put ahead of the
+# command. Tune from the OWW trace log line.
+WAKE_LOOKBACK_FRAMES = 4
+
+
 def _rescue_after_wake(device: Device, pending: bytes) -> int:
     """Move audio captured after a controller-scored wake into voice_queue.
 
@@ -3237,6 +3242,7 @@ async def _stream_listen(device: Device):
     await device.mic_start()
 
     buf = bytearray()
+    recent = collections.deque(maxlen=16)  # (frame, rms, score) of scored frames
     # openwakeword seeds its classifier window with embeddings of random noise
     # on construction AND on every reset(), so scores are partly scores of that
     # noise until the window has refilled. Un-warmed at construction to match
@@ -3465,6 +3471,7 @@ async def _stream_listen(device: Device):
                     None, model.predict, samples
                 )
                 score = prediction.get(model_key, 0.0)
+                recent.append((frame, rms, float(score)))
                 # Exactly once per chunk the MODEL saw, whatever the score —
                 # the `device.speaking` skip above returns before predict(),
                 # so the gate and the model stay in step.
@@ -3688,6 +3695,14 @@ async def _stream_listen(device: Device):
                         # frame belongs to this turn. Dropping it (the old
                         # path) cut 0.1-0.5s off a command spoken in the same
                         # breath as the wake word.
+                        # The model fires a few frames after the wake word
+                        # ends, and a fast talker is already mid-command by
+                        # then. Hand the turn the last frames it scored too.
+                        log.info(f"[{device.device_id}] OWW trace (rms,score) oldest->wake: " + " ".join(
+                            f"{r*1000:.0f}/{sc:.2f}" for _f, r, sc in recent))
+                        for _f, _r, _sc in list(recent)[-WAKE_LOOKBACK_FRAMES:] if WAKE_LOOKBACK_FRAMES else []:
+                            _put_voice_frame(device, _f)
+                        recent.clear()
                         rescued = _rescue_after_wake(device, after_wake)
                         if rescued:
                             log.info(f"[{device.device_id}] OWW: kept {rescued} "

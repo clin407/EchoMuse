@@ -201,7 +201,7 @@ class TurnTrace:
 # "...Jarvis" before the command arrives. N×80ms of bleed removed upfront.
 # 3 = 240ms. Lower if first command word gets clipped; raise if wake-word
 # tail bleeds into transcripts.
-VOICE_PREROLL_DISCARD = 3
+VOICE_PREROLL_DISCARD = 1
 
 # The rate the device plays: TTS is asked for, and decoded to, exactly this.
 WIRE_RATE = 48000
