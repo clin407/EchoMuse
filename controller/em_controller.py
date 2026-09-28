@@ -2434,6 +2434,27 @@ def _put_voice_frame(device: Device, chunk: bytes) -> None:
             pass
 
 
+def _rescue_after_wake(device: Device, pending: bytes) -> int:
+    """Move audio captured after a controller-scored wake into voice_queue.
+
+    `pending` is the unscored tail of the wake loop's buffer. mic_queue holds
+    frames that arrived but were not scored yet. Both follow the wake frame, so
+    both are the start of the command. VAD sentinels are dropped: they end the
+    wake stream, not the turn. Returns the number of frames moved."""
+    moved = 0
+    if pending:
+        _put_voice_frame(device, pending)
+        moved += 1
+    while True:
+        try:
+            item = device.mic_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return moved
+        if isinstance(item, (bytes, bytearray)):
+            _put_voice_frame(device, item)
+            moved += 1
+
+
 async def _run_voice_locked(device: Device, trigger_label: str = "unknown",
                             is_wakeword: bool = False, session: int | None = None):
     """
@@ -2456,7 +2477,11 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown",
             drained += 1
         except asyncio.QueueEmpty:
             break
-    while not device.voice_queue.empty():
+    # A controller-scored wake already put this command's first frames in
+    # voice_queue (_rescue_after_wake) and routed live audio there since, so
+    # none of it is stale. Every other turn starts from a clean queue.
+    rescued_turn = is_wakeword and session is None
+    while not rescued_turn and not device.voice_queue.empty():
         try:
             device.voice_queue.get_nowait()
             drained += 1
@@ -3612,6 +3637,9 @@ async def _stream_listen(device: Device):
                         # awaits it first.
                         model_reset = _reset_wake_model(model)
                         warmup.reset()
+                        # Captured after the crossing frame: the command's
+                        # first syllables, not stale audio. Rescued below.
+                        after_wake = bytes(buf)
                         buf.clear()
                         device.cancel_event.clear()
                         # Wake detail for the turn's persistent record —
@@ -3655,6 +3683,15 @@ async def _stream_listen(device: Device):
                         }
                         device.oww_paused.set()
                         device.oww_paused_since = asyncio.get_event_loop().time()
+                        # Same tick as the flag flip, so nothing live can land
+                        # ahead of it: audio already queued behind the wake
+                        # frame belongs to this turn. Dropping it (the old
+                        # path) cut 0.1-0.5s off a command spoken in the same
+                        # breath as the wake word.
+                        rescued = _rescue_after_wake(device, after_wake)
+                        if rescued:
+                            log.info(f"[{device.device_id}] OWW: kept {rescued} "
+                                     f"queued frames spoken after the wake word")
                         log.debug(
                             f"[{device.device_id}] OWW: oww_paused set, "
                             f"routing to voice_queue (no mic_stop/mic_start_turn)"
